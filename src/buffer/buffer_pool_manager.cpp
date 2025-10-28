@@ -130,8 +130,26 @@ auto BufferPoolManager::Size() const -> size_t {
  *
  * @return The page ID of the newly allocated page.
  */
-auto BufferPoolManager::NewPage() -> page_id_t { 
-  return next_page_id_++;
+auto BufferPoolManager::NewPage() -> page_id_t {
+  std::lock_guard<std::mutex> guard(*bpm_latch_);
+  
+  // 分配新页面ID
+  page_id_t new_page_id = next_page_id_++;
+  
+  // 将新页面写入磁盘（创建空页面）
+  auto promise = disk_scheduler_->CreatePromise();
+  auto future = promise.get_future();
+  char empty_data[BUSTUB_PAGE_SIZE] = {0};
+  DiskRequest request{
+    .is_write_ = true,
+    .data_ = empty_data,
+    .page_id_ = new_page_id,
+    .callback_ = std::move(promise)
+  };
+  disk_scheduler_->Schedule(std::move(request));
+  future.get();
+  
+  return new_page_id;
 }
 /**
  * @brief Removes a page from the database, both on disk and in memory.
@@ -246,7 +264,7 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
         }
         
         // 处理被驱逐的页面
-        auto evicted_frame = frames_[frame_id];
+        auto evicted_frame = frames_[frame_id].get();
         page_id_t old_page_id = INVALID_PAGE_ID;
         for (auto &entry : page_table_) {
           if (entry.second == frame_id) {
@@ -274,7 +292,7 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
       
       // 将新页面加载到帧中
       page_table_[page_id] = frame_id;
-      auto new_frame = frames_[frame_id];
+      auto new_frame = frames_[frame_id].get();
       new_frame->Reset();
       disk_manager_->ReadPage(page_id, new_frame->GetDataMut());
     }
@@ -286,18 +304,9 @@ auto BufferPoolManager::CheckedWritePage(page_id_t page_id, AccessType access_ty
   }
   
   // 在释放全局锁后获取页面锁，避免死锁
-  try {
-    frame->rwlatch_.lock();
-    return WritePageGuard(page_id, frames_[frame_id], std::shared_ptr<LRUKReplacer>(replacer_.get(), [](LRUKReplacer*){}), bpm_latch_, disk_scheduler_);
-  } catch (...) {
-    // 如果获取页面锁失败，需要回滚pin操作
-    std::lock_guard<std::mutex> guard(*bpm_latch_);
-    frame->pin_count_--;
-    if (frame->pin_count_ == 0) {
-      replacer_->SetEvictable(frame_id, true);
-    }
-    return std::nullopt;
-  }
+  frame->rwlatch_.lock();
+  
+  return WritePageGuard(page_id, frames_[frame_id], std::shared_ptr<LRUKReplacer>(replacer_.get(), [](LRUKReplacer*){}), bpm_latch_, disk_scheduler_);
 }
 
 /**
@@ -389,18 +398,9 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
   }
   
   // 在释放全局锁后获取页面锁，避免死锁
-  try {
-    frame->rwlatch_.lock_shared();
-    return ReadPageGuard(page_id, frames_[frame_id], std::shared_ptr<LRUKReplacer>(replacer_.get(), [](LRUKReplacer*){}), bpm_latch_, disk_scheduler_);
-  } catch (...) {
-    // 如果获取页面锁失败，需要回滚pin操作
-    std::lock_guard<std::mutex> guard(*bpm_latch_);
-    frame->pin_count_--;
-    if (frame->pin_count_ == 0) {
-      replacer_->SetEvictable(frame_id, true);
-    }
-    return std::nullopt;
-  }
+  frame->rwlatch_.lock_shared();
+  
+  return ReadPageGuard(page_id, frames_[frame_id], std::shared_ptr<LRUKReplacer>(replacer_.get(), [](LRUKReplacer*){}), bpm_latch_, disk_scheduler_);
 }
 
 /**
@@ -418,65 +418,13 @@ auto BufferPoolManager::CheckedReadPage(page_id_t page_id, AccessType access_typ
  * @return WritePageGuard A page guard ensuring exclusive and mutable access to a page's data.
  */
 auto BufferPoolManager::WritePage(page_id_t page_id, AccessType access_type) -> WritePageGuard {
-  std::lock_guard<std::mutex> guard(*bpm_latch_);
-  frame_id_t frame_id;
-  auto it = page_table_.find(page_id);
-  if (it != page_table_.end()) {
-    frame_id = it->second;
+  auto guard_opt = CheckedWritePage(page_id, access_type);
+  if (!guard_opt.has_value()) {
+    fmt::println(stderr, "\n`CheckedWritePage` failed to bring in page {}\n", page_id);
+    std::abort();
   }
-  else{
-    if (!free_list_.empty()) {
-      frame_id = free_list_.back();
-      free_list_.pop_back();
-    }
-    else{
-      if (!replacer_->Evict(&frame_id)) {
-        throw Exception("BufferPoolManager: All pages are pinned, cannot write page");
-      }
-      auto frame = frames_[frame_id];
-      page_id_t old_page_id =INVALID_PAGE_ID;
-      for(auto & entry:page_table_){
-        if (entry.second == frame_id) {
-          old_page_id = entry.first;
-          break;
-        }
-      }
-        if (frame->is_dirty_) {
-        auto promise = disk_scheduler_->CreatePromise();
-        auto future = promise.get_future();
-        DiskRequest request{
-          .is_write_ = true,
-          .data_ = const_cast<char*>(frame->GetData()),
-          .page_id_ = old_page_id,
-          .callback_ = std::move(promise)
-        };
-        disk_scheduler_->Schedule(std::move(request));
-        future.get();
-        frame->is_dirty_ = false;
-      }
-      page_table_.erase(old_page_id);
-      
-    }
-    page_table_[page_id] = frame_id;
-    auto frame = frames_[frame_id];
-    frame->Reset(); 
-    disk_manager_->ReadPage(page_id, frame->GetDataMut());
-    
-  }
-  auto frame = frames_[frame_id];
-  frame->pin_count_++;
-  replacer_->RecordAccess(frame_id, access_type);
-  replacer_->SetEvictable(frame_id, false);
-  frame->rwlatch_.lock();
-  return WritePageGuard(page_id, frame, std::shared_ptr<LRUKReplacer>(replacer_.get(), [](LRUKReplacer*){}), bpm_latch_, disk_scheduler_);
-  // auto guard_opt = CheckedWritePage(page_id, access_type);
-  // if (!guard_opt.has_value()) {
-  //   fmt::println(stderr, "\n`CheckedWritePage` failed to bring in page {}\n", page_id);
-  //   std::abort();
-
-  // }
   
-  // return std::move(guard_opt).value();
+  return std::move(guard_opt).value();
 }
 
 /**

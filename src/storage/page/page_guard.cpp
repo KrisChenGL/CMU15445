@@ -190,8 +190,15 @@ void ReadPageGuard::Drop() {
         replacer_->SetEvictable(frame_->frame_id_, true);
       }
     }
-
   }
+  
+  // 设置为无效状态
+  is_valid_ = false;
+  page_id_ = INVALID_PAGE_ID;
+  frame_ = nullptr;
+  replacer_ = nullptr;
+  bpm_latch_ = nullptr;
+  disk_scheduler_ = nullptr;
 }
 
 /** @brief The destructor for `ReadPageGuard`. This destructor simply calls `Drop()`. */

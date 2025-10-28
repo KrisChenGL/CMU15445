@@ -45,52 +45,51 @@ LRUKReplacer::LRUKReplacer(size_t num_frames, size_t k) : node_store_(), current
  */
 //标准lru_k算法
 auto LRUKReplacer::Evict(frame_id_t* frame_id) -> std::optional<frame_id_t> { 
-    std::lock_guard<std::mutex>guard(latch_);
-    if (current_size_ == 0){
-        return std::nullopt;
-    }
-    size_t max_distance = 0;
-    bool found = false;
-    frame_id_t victim = INVALID_FRAME_ID;
-    
-    // Find evictable frame with largest backward k-distance
-    for (auto &[fid, node] : node_store_) {
-        // Check if frame is evictable using is_accessible_
-        if (!is_accessible_[fid]) {
-          continue;
-        }
-        
-        size_t distance = 0;
-        // Use use_count_ instead of accessing private history_
-        if (use_count_[fid] < k_) {
-            distance = std::numeric_limits<size_t>::max();
-        } else {
-            // Simple distance calculation based on use count
-            distance = current_timestamp_ - use_count_[fid];
-        }
-        
-        if (!found || distance > max_distance || 
-            (distance == max_distance && use_count_[fid] < use_count_[victim])) {
-            found = true;
-            max_distance = distance;
-            victim = fid;
-        }
-    }
-    
-    if (!found) {
+    std::lock_guard<std::mutex> guard(latch_);
+    if (current_size_ == 0) {
         return std::nullopt;
     }
     
-    // Remove the victim frame
-    node_store_.erase(victim);
-    use_count_.erase(victim);
-    is_accessible_[victim] = false;
-    current_size_--;
-    
-    if (frame_id != nullptr) {
-        *frame_id = victim;
+    // 淘汰策略：
+    // 1. 优先淘汰 history_list_（访问次数 < K 的页面）
+    for (auto it = history_list_.begin(); it != history_list_.end(); ++it) {
+        frame_id_t fid = *it;
+        // 检查frame_id是否在有效范围内，并且是可驱逐的
+        if (fid >= 0 && static_cast<size_t>(fid) < replacer_size_ && is_accessible_[fid]) {
+            // Found evictable frame in history list
+            history_list_.erase(it);
+            history_map_.erase(fid);
+            node_store_.erase(fid);
+            use_count_.erase(fid);
+            is_accessible_[fid] = false;
+            current_size_--;
+            if (frame_id != nullptr) {
+                *frame_id = fid;
+            }
+            return fid;
+        }
     }
-    return victim;
+    
+    // 2. 如果 history_list_ 中没有可驱逐的页面，再淘汰 cache_list_（访问次数 >= K，LRU顺序）
+    for (auto it = cache_list_.begin(); it != cache_list_.end(); ++it) {
+        frame_id_t fid = *it;
+        // 检查frame_id是否在有效范围内，并且是可驱逐的
+        if (fid >= 0 && static_cast<size_t>(fid) < replacer_size_ && is_accessible_[fid]) {
+            // Found evictable frame in cache list
+            cache_list_.erase(it);
+            cache_map_.erase(fid);
+            node_store_.erase(fid);
+            use_count_.erase(fid);
+            is_accessible_[fid] = false;
+            current_size_--;
+            if (frame_id != nullptr) {
+                *frame_id = fid;
+            }
+            return fid;
+        }
+    }
+    
+    return std::nullopt;
 }
 
 //使用哈希+list实现的lru_k算法
@@ -221,22 +220,39 @@ auto LRUKReplacer::Evict(frame_id_t* frame_id) -> std::optional<frame_id_t> {
  * leaderboard tests.
  */
 void LRUKReplacer::RecordAccess(frame_id_t frame_id, [[maybe_unused]] AccessType access_type) {
-     std::lock_guard<std::mutex>guard(latch_);
-    //  if (frame_id >= static_cast<int>(replacer_size_)){
-    //      throw std::exception();
-    //  }
-    if (node_store_.find(frame_id) == node_store_.end()){
-        node_store_.emplace(frame_id, LRUKNode());
+    std::lock_guard<std::mutex> guard(latch_);
+    if (frame_id >= static_cast<int>(replacer_size_)) {
+        throw std::exception();
     }
-    // Record access in history_list_
-    history_list_.push_back(frame_id);
-    history_map_[frame_id] = std::prev(history_list_.end());
     
-    // Update use count
-    use_count_[frame_id]++;
-    
-    // Update timestamp
     current_timestamp_++;
+    size_t &count = use_count_[frame_id];
+    count++;
+    
+    // 新页面，第一次访问 → 放到 history_list_
+    if (count == 1) {
+        if (node_store_.find(frame_id) == node_store_.end()) {
+            node_store_.emplace(frame_id, LRUKNode());
+        }
+        history_list_.push_back(frame_id);
+        history_map_[frame_id] = --history_list_.end();
+        is_accessible_[frame_id] = false; // 默认不可驱逐，SetEvictable 决定
+    }
+    // 访问次数到 K → 从 history_list_ 移到 cache_list_
+    else if (count == k_) {
+        if (history_map_.count(frame_id)) {
+            history_list_.erase(history_map_[frame_id]);
+            history_map_.erase(frame_id);
+        }
+        cache_list_.push_back(frame_id);
+        cache_map_[frame_id] = --cache_list_.end();
+    }
+    // 访问次数 > K → 仅在 cache_list_ 中更新 LRU 位置
+    else if (count > k_ && cache_map_.count(frame_id)) {
+        cache_list_.erase(cache_map_[frame_id]);
+        cache_list_.push_back(frame_id);
+        cache_map_[frame_id] = --cache_list_.end();
+    }
 }
  
 
@@ -259,23 +275,21 @@ void LRUKReplacer::RecordAccess(frame_id_t frame_id, [[maybe_unused]] AccessType
  * @param set_evictable whether the given frame is evictable or not
  */
 void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {
-     std::lock_guard<std::mutex>guard(latch_);
-     if (frame_id >= static_cast<int>(replacer_size_)){
-         throw std::exception();
-     }
-     if (use_count_[frame_id]==0 ){
+    std::lock_guard<std::mutex> guard(latch_);
+    if (frame_id >= static_cast<int>(replacer_size_)) {
+        throw std::exception();
+    }
+    // Frame 不存在，直接返回
+    if (use_count_.find(frame_id) == use_count_.end()) {
         return;
-     }
-     bool was_evictable = is_accessible_[frame_id];
-     is_accessible_[frame_id] = set_evictable;
-     if(!was_evictable && set_evictable){
+    }
+    bool was = is_accessible_[frame_id];
+    if (!was && set_evictable) {
         current_size_++;
-
-     }
-     else if(was_evictable && !set_evictable){
+    } else if (was && !set_evictable) {
         current_size_--;
-
-     }
+    }
+    is_accessible_[frame_id] = set_evictable;
 }
 
 /**
@@ -296,43 +310,29 @@ void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {
  * @param frame_id id of frame to be removed
  */
 void LRUKReplacer::Remove(frame_id_t frame_id) {
-     std::lock_guard<std::mutex>guard(latch_);
-     if (frame_id >= static_cast<int>(replacer_size_)){
+    std::lock_guard<std::mutex> guard(latch_);
+    if (frame_id >= static_cast<int>(replacer_size_)) {
         throw std::exception();
-     }
-     auto it = node_store_.find(frame_id);
-     if (it == node_store_.end()) {
-        return;  
     }
-
-     if (use_count_.find(frame_id) == use_count_.end()){
-        return;
-     }
-     
-     // Check if frame is evictable before removing
-     if (!is_accessible_[frame_id]) {
-        throw std::exception(); // Cannot remove non-evictable frame
-     }
-     
-     // Remove from all data structures
-     node_store_.erase(it);
-     use_count_.erase(frame_id);
-     
-     // Remove from history_list_ if present
-     auto hist_it = history_map_.find(frame_id);
-     if (hist_it != history_map_.end()) {
-        history_list_.erase(hist_it->second);
-        history_map_.erase(hist_it);
-     }
-     
-     // Remove from cache_list_ if present
-     auto cache_it = cache_map_.find(frame_id);
-     if (cache_it != cache_map_.end()) {
-        cache_list_.erase(cache_it->second);
-        cache_map_.erase(cache_it);
-     }
-     
-     current_size_--;
+    auto it = use_count_.find(frame_id);
+    if (it == use_count_.end()) {
+        return; // 不存在
+    }
+    if (!is_accessible_[frame_id]) {
+        throw std::exception(); // Cannot remove a non-evictable frame
+    }
+    // 从双队列中删除
+    if (history_map_.count(frame_id)) {
+        history_list_.erase(history_map_[frame_id]);
+        history_map_.erase(frame_id);
+    } else if (cache_map_.count(frame_id)) {
+        cache_list_.erase(cache_map_[frame_id]);
+        cache_map_.erase(frame_id);
+    }
+    node_store_.erase(frame_id);
+    use_count_.erase(it);
+    is_accessible_[frame_id] = false;
+    current_size_--;
 }
 
 /**
